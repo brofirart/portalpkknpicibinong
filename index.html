@@ -369,37 +369,87 @@ a{color:inherit; text-decoration:none;}
       30 hari lalu terkunci) sudah cukup untuk mulai; setelah itu perlu
       diperpanjang manual di tab Rules Firestore (klik "Publish" lagi). */
 const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyDwRGLg8qo3ns8_RSQLMrXe3oG7r0w1--s",
-  authDomain: "pkknpicibinong.firebaseapp.com",
-  projectId: "pkknpicibinong",
-  storageBucket: "pkknpicibinong.firebasestorage.app",
-  messagingSenderId: "50353718742",
-  appId: "1:50353718742:web:fd216bf1991e65451ed077"
+  apiKey: "GANTI_DENGAN_API_KEY_ANDA",
+  authDomain: "GANTI.firebaseapp.com",
+  projectId: "GANTI_PROJECT_ID",
+  storageBucket: "GANTI.appspot.com",
+  messagingSenderId: "GANTI",
+  appId: "GANTI"
 };
 
 const _fbApp = firebase.initializeApp(FIREBASE_CONFIG);
 const _fbDb = firebase.firestore();
 const _FB_COLLECTION = 'knpicibinong'; // semua data disimpan di koleksi ini, 1 dokumen per key
+const _FB_CHUNK_SIZE = 700000; // batas aman per dokumen (Firestore max ~1MB/dokumen)
 
+/* Firestore membatasi ukuran 1 dokumen sekitar 1MB. Karena berita/galeri
+   di situs ini menyimpan foto sebagai teks base64 (bisa jadi besar kalau
+   ada beberapa foto sekaligus), data seperti itu perlu dipecah otomatis
+   menjadi beberapa dokumen kecil ("chunk") supaya tidak ditolak Firestore.
+   Fungsi di bawah ini menangani pemecahan & penggabungan itu secara
+   transparan, sehingga kode admin (saveNews, saveGal, dst) tidak perlu
+   diubah sama sekali. */
 window.storage = {
   async get(key){
     try{
       const doc = await _fbDb.collection(_FB_COLLECTION).doc(key).get();
       if(!doc.exists) return null;
       const data = doc.data();
+      if(data && data.chunked){
+        const count = data.count || 0;
+        const parts = await Promise.all(
+          Array.from({length: count}, (_, i) =>
+            _fbDb.collection(_FB_COLLECTION).doc(key + '__chunk_' + i).get()
+          )
+        );
+        const value = parts.map(p => (p.exists ? p.data().part : '')).join('');
+        return { key, value, shared: true };
+      }
       if(data.value === null || data.value === undefined) return null;
       return { key, value: data.value, shared: true };
     }catch(e){ console.error('storage.get error', e); return null; }
   },
   async set(key, value){
     try{
-      await _fbDb.collection(_FB_COLLECTION).doc(key).set({ value, updatedAt: Date.now() });
+      const str = typeof value === 'string' ? value : JSON.stringify(value);
+      // Hapus dulu chunk lama (kalau sebelumnya dokumen ini pernah di-chunk
+      // dengan jumlah lebih banyak), supaya tidak ada sisa data basi.
+      const oldDoc = await _fbDb.collection(_FB_COLLECTION).doc(key).get();
+      const oldCount = (oldDoc.exists && oldDoc.data().chunked) ? (oldDoc.data().count || 0) : 0;
+
+      if(str.length > _FB_CHUNK_SIZE){
+        const chunks = [];
+        for(let i=0; i<str.length; i+=_FB_CHUNK_SIZE) chunks.push(str.slice(i, i+_FB_CHUNK_SIZE));
+        const batch = _fbDb.batch();
+        chunks.forEach((part, i) => {
+          batch.set(_fbDb.collection(_FB_COLLECTION).doc(key + '__chunk_' + i), { part });
+        });
+        for(let i=chunks.length; i<oldCount; i++){
+          batch.delete(_fbDb.collection(_FB_COLLECTION).doc(key + '__chunk_' + i));
+        }
+        batch.set(_fbDb.collection(_FB_COLLECTION).doc(key), { chunked: true, count: chunks.length, updatedAt: Date.now() });
+        await batch.commit();
+      } else {
+        const batch = _fbDb.batch();
+        for(let i=0; i<oldCount; i++){
+          batch.delete(_fbDb.collection(_FB_COLLECTION).doc(key + '__chunk_' + i));
+        }
+        batch.set(_fbDb.collection(_FB_COLLECTION).doc(key), { value, chunked: false, updatedAt: Date.now() });
+        await batch.commit();
+      }
       return { key, value, shared: true };
-    }catch(e){ console.error('storage.set error', e); return null; }
+    }catch(e){ console.error('storage.set error', e); toast && toast('Gagal menyimpan: ' + (e.message||e)); return null; }
   },
   async delete(key){
     try{
-      await _fbDb.collection(_FB_COLLECTION).doc(key).delete();
+      const oldDoc = await _fbDb.collection(_FB_COLLECTION).doc(key).get();
+      const oldCount = (oldDoc.exists && oldDoc.data().chunked) ? (oldDoc.data().count || 0) : 0;
+      const batch = _fbDb.batch();
+      for(let i=0; i<oldCount; i++){
+        batch.delete(_fbDb.collection(_FB_COLLECTION).doc(key + '__chunk_' + i));
+      }
+      batch.delete(_fbDb.collection(_FB_COLLECTION).doc(key));
+      await batch.commit();
       return { key, deleted: true, shared: true };
     }catch(e){ console.error('storage.delete error', e); return null; }
   },
@@ -408,6 +458,7 @@ window.storage = {
       const snap = await _fbDb.collection(_FB_COLLECTION).get();
       const keys = [];
       snap.forEach(doc => {
+        if(doc.id.includes('__chunk_')) return; // sembunyikan dokumen pecahan internal
         if(!prefix || doc.id.startsWith(prefix)) keys.push(doc.id);
       });
       return { keys, prefix: prefix || undefined, shared: true };
